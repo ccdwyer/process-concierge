@@ -1,0 +1,16 @@
+{
+  "name": "process-concierge",
+  "version": "0.1.0",
+  "description": "Gives every dev server, watcher and background process the agent starts an owner, a port and a stop button, and catches duplicate starts",
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "Chris Dwyer",
+    "url": "https://github.com/ccdwyer"
+  },
+  "repository": "https://github.com/ccdwyer/process-concierge",
+  "homepage": "https://github.com/ccdwyer/process-concierge",
+  "supportUrl": "https://github.com/ccdwyer/process-concierge/issues",
+  "documentationUrl": "https://github.com/ccdwyer/process-concierge#readme",
+  "privacyPolicyUrl": "https://github.com/ccdwyer/process-concierge/blob/main/PRIVACY.md",
+  "license": "MIT"
+}
