@@ -1,0 +1,149 @@
+#!/bin/sh
+# Process Concierge supervisor.
+#
+#   pc-run TOKEN LEDGER_DIR MODE SHELL -- COMMAND
+#
+# Runs COMMAND (one command line, run by SHELL -c) as the only job of a new process group that this script
+# leads, and records itself in LEDGER_DIR/TOKEN.run. It stops the whole group when asked: a LEDGER_DIR/TOKEN.stop
+# file appears, it receives SIGTERM or SIGINT, or (MODE "task") the shell that launched it goes away. Stopping
+# is SIGTERM to the group, then SIGKILL after a grace period. Because this script leads the group and stays
+# alive until the group is empty, the group id cannot belong to anything else while it signals it.
+#
+# MODE "task": the launching shell waits for this script (a foreground or run-in-background command).
+# MODE "detached": the launching shell sent this script to the background with `&` and moves on.
+#
+# If it cannot lead a new group, it runs COMMAND unsupervised and writes no ledger entry, so Process
+# Concierge shows the job without a stop button.
+
+# Every program this script runs is named by absolute path, and before any perl runs the environment is cleaned of
+# what could make it run code the approved command never named: PERL5OPT and friends (read by perl before -e),
+# and exported shell functions (which a shell imports and which would shadow commands by name). Until then only
+# `case` and `exec` are used: special builtins that a function can't replace. The job gets PERL5OPT/PERL5LIB back.
+
+tok=$1
+dir=$2
+mode=$3
+sh_=$4
+case "$tok" in '' | *[!0-9a-f]*) exec /bin/sh -c 'echo "pc-run: bad token" >&2; exit 64' ;; esac
+case "$mode" in task | detached) ;; *) exec /bin/sh -c 'echo "pc-run: bad mode" >&2; exit 64' ;; esac
+case "$5" in --) ;; *) exec /bin/sh -c 'echo "pc-run: usage: pc-run TOKEN LEDGER_DIR MODE SHELL -- COMMAND" >&2; exit 64' ;; esac
+
+# Become the leader of a new process group (same pid: perl execs back into this script). The launching shell
+# is noted first, so a launcher that dies during setup is still noticed.
+case "${PC_RUN_GROUP:-}" in
+  "$tok") ;;
+  *)
+    PC_RUN_GROUP=$tok
+    PC_RUN_PARENT=$PPID
+    PC_RUN_P5O=${PERL5OPT-}
+    PC_RUN_P5L=${PERL5LIB-}
+    export PC_RUN_GROUP PC_RUN_PARENT PC_RUN_P5O PC_RUN_P5L
+    exec /usr/bin/env -u PERL5OPT -u PERL5LIB -u PERLLIB -u PERL5DB -u BASH_ENV -u ENV /usr/bin/perl -e '
+      for (keys %ENV) { delete $ENV{$_} if /^BASH_FUNC_/ || $ENV{$_} =~ /^\(\)\s*\{/ }
+      setpgrp(0, 0);
+      exec "/bin/sh", @ARGV' "$0" "$@"
+    ;;
+esac
+parent=${PC_RUN_PARENT:-0}
+unset PC_RUN_GROUP PC_RUN_PARENT
+case "$sh_" in /*) [ -x "$sh_" ] || sh_=/bin/sh ;; *) sh_=/bin/sh ;; esac
+cmd=$6
+
+# Run the job unsupervised (no group of its own could be made): the shell without its startup files.
+plain() {
+  exec /usr/bin/perl -e '
+    for my $k (qw(PERL5OPT PERL5LIB)) { my $v = delete $ENV{"PC_RUN_" . ($k eq "PERL5OPT" ? "P5O" : "P5L")}; $ENV{$k} = $v if defined $v && $v ne "" }
+    my ($sh, $cmd) = @ARGV;
+    exec $sh, ($sh =~ m{/zsh$} ? ("-f") : ()), "-c", "--", $cmd' "$sh_" "$cmd"
+}
+
+me=$$
+lead=$(/bin/ps -o pgid= -p "$me" | /usr/bin/tr -d ' ')
+[ "$lead" = "$me" ] || plain
+
+# The job keeps the caller's umask and standard input.
+mask=$(umask)
+exec 3<&0
+umask 077
+/bin/mkdir -p "$dir" 2>/dev/null || { umask "$mask"; exec 3<&-; plain; }
+
+start=$(LC_ALL=C /bin/ps -o lstart= -p "$me" | /usr/bin/tr -s ' ' | /usr/bin/sed 's/^ //;s/ $//')
+printf 'pid=%s\nlstart=%s\nmode=%s\ncwd=%s\n' "$me" "$start" "$mode" "$PWD" > "$dir/$tok.run.$me" &&
+  /bin/mv -f "$dir/$tok.run.$me" "$dir/$tok.run"
+
+req=0
+trap 'req=1' TERM INT
+
+psfile="$dir/$tok.ps"
+# The job is started directly (no waiting subshell, which would hold the caller's output open). perl gives it
+# back the caller's umask and the signal dispositions an asynchronous child would otherwise start with (SIGINT
+# and SIGQUIT ignored), then runs it in the user's shell with the caller's standard input.
+PC_RUN_MASK=$mask /usr/bin/perl -e '
+  umask oct(delete $ENV{PC_RUN_MASK});
+  $SIG{$_} = "DEFAULT" for qw(INT QUIT HUP TERM);
+  for my $k (qw(PERL5OPT PERL5LIB)) { my $v = delete $ENV{"PC_RUN_" . ($k eq "PERL5OPT" ? "P5O" : "P5L")}; $ENV{$k} = $v if defined $v && $v ne "" }
+  my ($sh, $cmd) = @ARGV;
+  exec($sh, ($sh =~ m{/zsh$} ? ("-f") : ()), "-c", "--", $cmd) or exit 127' "$sh_" "$cmd" <&3 3<&- &
+child=$!
+# The supervisor lets go of its own copies of the caller's input and output.
+exec 3<&- </dev/null >/dev/null 2>&1
+# Ignoring a terminal hangup is the supervisor's alone: the job was started before this.
+trap '' HUP
+
+# Sets `left` to how many live members the group has besides this script, or "?" when the look failed. It runs
+# in this shell (never in a command substitution, whose subshell would be a member), and its `ps` runs in its
+# own group (perl leaves this one before it starts ps), so the look itself is never counted.
+census() {
+  left='?'
+  /usr/bin/perl -e 'setpgrp(0, 0); exec "/bin/ps", @ARGV' -- -A -o pid=,pgid=,stat= > "$psfile" 2>/dev/null || return
+  [ -s "$psfile" ] || return
+  left=0
+  while read -r p g s; do
+    [ "$g" = "$me" ] || continue
+    [ "$p" = "$me" ] && continue
+    case "$s" in Z*) continue ;; esac
+    left=$((left + 1))
+  done < "$psfile"
+}
+
+code=
+phase=run
+since=0
+grace=${PC_RUN_GRACE:-3}
+while :; do
+  census
+  if [ "$left" = 0 ]; then
+    # Nothing of the job is left; the job's own process has exited, so this returns its status at once.
+    wait "$child" 2>/dev/null
+    code=$?
+    break
+  fi
+  if [ "$phase" = run ]; then
+    gone=0
+    # Only a successful look that shows one different parent counts as gone; anything else means "still there".
+    if [ "$mode" = task ] && [ "$parent" != 0 ]; then
+      if out=$(/bin/ps -o ppid= -p "$me" 2>/dev/null); then
+        now=$(printf '%s' "$out" | /usr/bin/tr -d ' \n')
+        case "$now" in '' | *[!0-9]*) ;; *) [ "$now" != "$parent" ] && gone=1 ;; esac
+      fi
+    fi
+    if [ "$req" = 1 ] || [ -e "$dir/$tok.stop" ] || [ "$gone" = 1 ]; then
+      phase=term
+      since=$(/bin/date +%s)
+      trap '' TERM INT
+      kill -s TERM -- "-$me" 2>/dev/null
+    fi
+  elif [ $(( $(/bin/date +%s) - since )) -ge "$grace" ]; then
+    printf 'exit=killed\n' > "$dir/$tok.exit"
+    /bin/rm -f "$psfile" "$dir/$tok.stop" "$dir/$tok.run"
+    kill -s KILL -- "-$me"
+  fi
+  /bin/sleep 0.25
+done
+if [ "$phase" = term ]; then
+  printf 'exit=stopped\ncode=%s\n' "${code:-0}" > "$dir/$tok.exit"
+else
+  printf 'exit=%s\n' "${code:-0}" > "$dir/$tok.exit"
+fi
+/bin/rm -f "$psfile" "$dir/$tok.stop" "$dir/$tok.run"
+exit "${code:-0}"
