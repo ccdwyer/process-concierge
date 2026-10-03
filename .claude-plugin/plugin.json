@@ -1,6 +1,6 @@
 {
   "name": "process-concierge",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Gives every dev server, watcher and background process the agent starts an owner, a port and a stop button, and catches duplicate starts",
   "types": "./types/index.d.ts",
   "author": {

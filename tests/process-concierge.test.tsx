@@ -48,7 +48,7 @@ describe('wrapping jobs in the supervisor', () => {
     const w = wrap('cd web && npm run dev', true, SCRIPT, LEDGER, SH, tok)
     expect(w.jobs).toHaveLength(1)
     expect(w.jobs[0]?.mode).toBe('task')
-    expect(w.command).toBe(`/bin/sh ${q(SCRIPT)} ${w.jobs[0]?.token} ${q(LEDGER)} task ${q(SH)} -- ${q('cd web && npm run dev')}`)
+    expect(w.command).toBe(`/usr/bin/env -u SHELLOPTS -u BASHOPTS /bin/sh ${q(SCRIPT)} ${w.jobs[0]?.token} ${q(LEDGER)} task ${q(SH)} -- ${q('cd web && npm run dev')}`)
   })
 
   test('a mixed "a & b" background call is one supervised group, so both siblings are covered', async () => {
@@ -60,21 +60,29 @@ describe('wrapping jobs in the supervisor', () => {
   test('a foreground call is wrapped only when it is one simple command, never split', async () => {
     const one = wrap('npm run dev > dev.log 2>&1 &', false, SCRIPT, LEDGER, SH, tok)
     expect(one.jobs.map(j => j.mode)).toEqual(['detached'])
-    expect(one.command).toMatch(/^\/bin\/sh .* detached '\/bin\/zsh' -- 'npm run dev > dev\.log 2>&1' &$/)
+    expect(one.command).toMatch(/^\/usr\/bin\/env -u SHELLOPTS -u BASHOPTS \/bin\/sh .* detached '\/bin\/zsh' -- 'npm run dev > dev\.log 2>&1' &$/)
     const fg = wrap('npx vite --port 5173', false, SCRIPT, LEDGER, SH, tok)
     expect(fg.jobs.map(j => j.mode)).toEqual(['task'])
-    // Several commands on one line: untouched, every job reported (shown without a stop button).
-    for (const cmd of ["npm run dev & sleep 2 && curl -s 'localhost:4000'", 'node api.js & node worker.js &', 'cd web && npm run dev &']) {
+    // An `&` mid-line: untouched (wrapping would change what the call returns); the jobs are reported for the
+    // duplicate check only.
+    for (const cmd of ["npm run dev & sleep 2 && curl -s 'localhost:4000'", 'node api.js & node worker.js &']) {
       const w = wrap(cmd, false, SCRIPT, LEDGER, SH, tok)
       expect(w.command).toBe(cmd)
       expect(w.jobs).toHaveLength(0)
       expect(w.unsafe.length).toBeGreaterThan(0)
     }
+    // A whole list, foreground or ended by the line's one `&`: wrapped whole, the text unchanged inside.
+    const list = wrap('cd web && npm run dev', false, SCRIPT, LEDGER, SH, tok)
+    expect(list.jobs.map(j => [j.mode, j.text])).toEqual([['task', 'npm run dev']])
+    expect(list.command).toContain(`-- ${q('cd web && npm run dev')}`)
+    const bgList = wrap('cd web && npm run dev &', false, SCRIPT, LEDGER, SH, tok)
+    expect(bgList.jobs.map(j => j.mode)).toEqual(['detached'])
+    expect(bgList.command).toMatch(new RegExp(`-- ${q('cd web && npm run dev').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} &$`))
   })
 
   test('constructs that splitting could change are never rewritten', async () => {
     for (const cmd of [
-      'npm run dev >| touch /tmp/pc-marker', 'npm run dev 2>| log &', 'exec npm run dev', 'exec npm run dev; dangerous-command',
+      'exec npm run dev', 'exec npm run dev; dangerous-command',
       'set -C; npm run dev > existing.log &', 'npm run dev --tag "$(whoami)" &', 'eval npm run dev', 'setsid node server.js &',
       'setsid --invalid-option npm run dev &', 'nohup setsid npm run dev &', '/usr/bin/setsid npm run dev &',
       'node app.js & &', 'node app.js & ||', 'node app.js & &&', 'node app.js & ;', 'node app.js &|', 'npm run dev &&', 'npm run dev ||',
@@ -86,16 +94,53 @@ describe('wrapping jobs in the supervisor', () => {
     }
   })
 
+  test('a `>|` redirect is not a pipe, and the text reaches the shell unchanged', async () => {
+    const w = wrap('npm run dev 2>| log &', false, SCRIPT, LEDGER, SH, tok)
+    expect(w.jobs.map(j => j.text)).toEqual(['npm run dev 2>| log'])
+    expect(w.command).toContain(`-- ${q('npm run dev 2>| log')} &`)
+  })
+
+  test('disguised setsid, ANSI-C and glued quotes, and computed command words are never wrapped or checked', async () => {
+    for (const [cmd, background] of [
+      ["$'setsid' npm run dev &", false], ["set''sid npm run dev &", false], ['"set"sid npm run dev &', false],
+      ["cd web && $'setsid' npm run dev", true], ['X=setsid; $X npm run dev', true], ['"$RUNNER" run dev &', false],
+      ['cat <<EOF &\nnpm run dev\nEOF', false], ['echo \\& npm run dev &', false], ['npm run dev # & npm run dev', false],
+      ['node app.js & &', false], ['cd - && npm run dev &', false],
+    ] as [string, boolean][]) {
+      const w = wrap(cmd, background, SCRIPT, LEDGER, SH, tok)
+      expect(w.command).toBe(cmd)
+      expect(w.jobs).toHaveLength(0)
+      // Unreadable or malformed: not even the duplicate check may refuse it.
+      expect(w.unsafe).toHaveLength(0)
+    }
+    // `=` before a quote is an ordinary argument, not a glued word.
+    expect(wrap('npx vite --port="5173" &', false, SCRIPT, LEDGER, SH, tok).jobs).toHaveLength(1)
+  })
+
+  test('start directories: env -C, pushd/popd, and arguments after --', async () => {
+    expect(startDir('/usr/bin/env -C /tmp npm run dev', 0, '/repo', '/home/me')).toBe('/tmp')
+    expect(startDir('env --chdir=/srv npm run dev', 0, '/repo', '/home/me')).toBe('/srv')
+    expect(startDir('pushd /tmp && popd && npm run dev', 2, '/repo', '/home/me')).toBe('/repo')
+    expect(startDir('cd && npm run dev', 1, '/repo', '/home/me')).toBe('/home/me')
+    expect(startDir('npm run dev -- --cwd /tmp', 0, '/repo', '/home/me')).toBe('/repo')
+    expect(startDir('npm --prefix web run dev', 0, '/repo', '/home/me')).toBe('/repo/web')
+  })
+
+  test('commands in a pipeline run at the same time', async () => {
+    expect(jobs('npm run dev | tee dev.log', false).map(j => j.concurrent)).toEqual([true])
+    expect(jobs('npm run dev || npm run dev', false).every(j => !j.concurrent)).toBe(true)
+  })
+
   test('quotes in a job survive the wrapping', async () => {
     expect(q("it's")).toBe(`'it'\\''s'`)
     const w = wrap(`node app.js --name 'a b' &`, false, SCRIPT, LEDGER, SH, tok)
     expect(w.command).toContain(`-- 'node app.js --name '\\''a b'\\'''`)
   })
 
-  test('jobs in syntax the mod does not split safely are left untouched and reported', async () => {
+  test('jobs in syntax the mod does not read are left untouched, and not even checked', async () => {
     const sub = wrap('(npm run dev &)', false, SCRIPT, LEDGER, SH, tok)
     expect(sub.command).toBe('(npm run dev &)')
-    expect(sub.unsafe.length).toBeGreaterThan(0)
+    expect(sub.unsafe).toHaveLength(0)
     const doc = wrap('cat <<EOF > x\nhi\nEOF\nnode s.js &', false, SCRIPT, LEDGER, SH, tok)
     expect(doc.command).toBe('cat <<EOF > x\nhi\nEOF\nnode s.js &')
     expect(doc.jobs).toHaveLength(0)
@@ -166,12 +211,19 @@ function fakeOs() {
   const out = (stdout: string, exitCode = 0) => ({ exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false })
   const answer = (argv: readonly string[]) => {
     argvs.push([...argv])
-    if (argv[0] === 'ps') return out(table.map(p => `${p.pid} ${p.ppid} ${p.pgid} 1.0 2048 ${p.lstart}  ${p.command}`).join('\n'))
-    if (argv[0] === 'lsof') {
+    // Helpers are run by absolute path; the fake answers by program name.
+    const prog = (argv[0] ?? '').split('/').pop()
+    if (prog === 'ps' && argv.includes('-p')) {
+      const pid = Number(argv[argv.indexOf('-p') + 1])
+      const p = table.find(x => x.pid === pid)
+      return p === undefined ? out('', 1) : out(`${p.lstart}\n`)
+    }
+    if (prog === 'ps') return out(table.map(p => `${p.pid} ${p.ppid} ${p.pgid} 1.0 2048 ${p.lstart}  ${p.command}`).join('\n'))
+    if (prog === 'lsof') {
       const lines = table.filter(p => p.ports.length > 0).flatMap(p => [`p${p.pid}`, ...p.ports.map(n => `n*:${n}`)])
       return out(lines.join('\n'), lines.length > 0 ? 0 : 1)
     }
-    if (argv[0] === 'rm') {
+    if (prog === 'rm') {
       for (const path of argv.slice(3)) files.delete(path)
       return out('')
     }
@@ -236,7 +288,7 @@ function world(on: On, os: ReturnType<typeof fakeOs>, failWrites = false, tools 
     os.write(e.path, e.text)
     return { value: undefined }
   })
-  on('fs.exists', (_$, e) => ({ value: (tools && ['/usr/bin/perl', '/usr/bin/env', '/bin/ps'].includes(e.path)) || os.files.has(e.path) }))
+  on('fs.exists', (_$, e) => ({ value: (tools && ['/usr/bin/perl', '/usr/bin/env', '/bin/ps', '/usr/sbin/lsof', '/bin/rm'].includes(e.path)) || os.files.has(e.path) }))
   on('fs.list', (_$, e) => ({
     value: [...os.files.keys()]
       .filter(k => k.startsWith(`${e.path}/`))
@@ -390,7 +442,7 @@ test("someone else's server on the machine is shown only, never stoppable", asyn
   expect([...os.files.keys()].some(k => k.endsWith('.stop'))).toBe(false)
 })
 
-test('a job in syntax the mod cannot wrap is shown without a stop button', async ($, on) => {
+test('a job in syntax the mod cannot read is run as written, neither recorded nor refused', async ($, on) => {
   const os = fakeOs()
   world(on, os)
   let seen = ''
@@ -401,7 +453,7 @@ test('a job in syntax the mod cannot wrap is shown without a stop button', async
   await $.command.run({ command: 'procs', args: '' } as never)
   await $.tool.call({ tool: 'Bash', command: '(cd web && npm run dev &)' })
   expect(seen).toBe('(cd web && npm run dev &)')
-  expect(await procsText($ as never)).toMatch(/\[unsupervised\]/)
+  expect(await procsText($ as never)).not.toMatch(/npm run dev/)
 })
 
 test('a supervisor from an earlier session found in the ledger is listed and can be stopped', async ($, on) => {
@@ -500,7 +552,7 @@ test('a supervisor that checks in just after the table was read is not taken for
     const hidden = os.table.filter(p => p.pid > 1)
     const answer = os.answer
     os.answer = (argv: readonly string[]) => {
-      if (argv[0] === 'ps' && reads === 0) {
+      if ((argv[0] ?? '').endsWith('/ps') && reads === 0) {
         reads += 1
         const keep = os.table.splice(0, os.table.length, ...os.table.filter(p => !hidden.includes(p)))
         const r = answer(argv)
@@ -580,7 +632,7 @@ test('a short job that finished between looks is reported as finished, not unsup
   expect(text).not.toMatch(/unsupervised/)
 })
 
-test('without perl nothing is rewritten and jobs are shown without a stop button', async ($, on) => {
+test('without perl nothing is rewritten, and nothing is recorded or refused', async ($, on) => {
   const os = fakeOs()
   world(on, os, false, false)
   let seen = ''
@@ -591,5 +643,24 @@ test('without perl nothing is rewritten and jobs are shown without a stop button
   await $.command.run({ command: 'procs', args: '' } as never)
   await $.tool.call(bg('npm run dev'))
   expect(seen).toBe('npm run dev')
-  expect(await procsText($ as never)).toMatch(/\[unsupervised\]/)
+  expect(await procsText($ as never)).not.toMatch(/npm run dev/)
+})
+
+test('a ledger whose supervisor checked in after the boot-time table was read is kept; a dead one is removed', async ($, on) => {
+  const os = fakeOs()
+  world(on, os)
+  const live = 'dddddddddddddddddddddddd'
+  const dead = 'eeeeeeeeeeeeeeeeeeeeeeee'
+  const sup = { pid: 950, ppid: 1, pgid: 950, command: `/bin/sh /plugins/process-concierge/bin/pc-run ${live} ${LEDGER} detached -- node s.js`, lstart: LSTART, ports: [] }
+  os.files.set(`${LEDGER}/${live}.run`, `pid=950\nlstart=${LSTART}\nmode=detached\ncwd=/repo\n`)
+  os.files.set(`${LEDGER}/${dead}.run`, `pid=960\nlstart=${LSTART}\nmode=detached\ncwd=/repo\n`)
+  // The whole-table read at boot misses the live supervisor; it is there by the time one pid is looked at again.
+  const answer = os.answer
+  os.answer = (argv: readonly string[]) => {
+    if ((argv[0] ?? '').endsWith('/ps') && argv.includes('-p') && !os.table.includes(sup)) os.table.push(sup)
+    return answer(argv)
+  }
+  await $.command.run({ command: 'procs', args: '' } as never)
+  expect(os.files.has(`${LEDGER}/${live}.run`)).toBe(true)
+  expect(os.files.has(`${LEDGER}/${dead}.run`)).toBe(false)
 })

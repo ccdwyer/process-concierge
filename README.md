@@ -12,21 +12,20 @@ A Claude Code mod that gives every dev server, watcher and background job the ag
 
 Process Concierge doesn't guess which processes belong to a job. It makes each job's processes a group it can prove it owns:
 
-1. **The command is rewritten to launch through the supervisor, and is never split.** For a `run_in_background` call, the whole command line is handed unchanged to the supervisor, which runs it in your shell. `node api.js & node worker.js` is one group, so both are covered. A foreground call is rewritten only when it's exactly one simple command, optionally with one trailing `&` (`npm run dev > dev.log 2>&1 &`). Anything longer is left as you wrote it, and its jobs are shown without a stop button. Each supervisor has a random token.
-2. **The supervisor checks in.** It uses `perl` (part of macOS) to put itself in a new process group it leads. Every helper it runs is called by absolute path (`/bin/ps`, `/bin/date`, …). It first clears what could make it run code your command never named: `PERL5OPT`/`PERL5LIB` and exported shell functions. Your job still gets `PERL5OPT` and `PERL5LIB` back. It writes its pid and start time to `~/.cache/process-concierge/ledger/<token>.run` (folder mode 700). It then runs the job in your own shell (`$SHELL` if it's zsh or bash, else `/bin/sh`; zsh runs with `-f`, so no startup files), with your stdin, umask and normal signal handling. It lets go of its own copies of your terminal output, so a caller waiting for output to end isn't held open, and it stays alive until every process in the group has exited.
+1. **The command is rewritten to launch through the supervisor, and is never split.** The whole command line is handed unchanged to the supervisor, which runs it in your shell, so `node api.js & node worker.js` (in a `run_in_background` call) or `cd web && npm run dev` is one group with one stop button. A foreground line is wrapped when nothing in it is sent to the background, or when its only `&` is the one at the very end (`cd web && npm run dev > dev.log 2>&1 &`). Each supervisor has a random token.
+2. **The supervisor checks in.** It uses `perl` (part of macOS) to put itself in a new process group it leads. Every helper it runs is called by absolute path (`/bin/ps`, `/bin/date`, …). It first clears what could make it run code your command never named: `PERL5OPT`/`PERL5LIB`, exported shell functions, and `SHELLOPTS`/`BASHOPTS` (an inherited job-control or errexit setting would otherwise move the job out of its group). It turns job control off itself too. Your job still gets `PERL5OPT` and `PERL5LIB` back. It writes its pid and start time to `~/.cache/process-concierge/ledger/<token>.run` (folder mode 700). It then runs the job in your own shell (`$SHELL` if it's zsh or bash, else `/bin/sh`; zsh runs with `-f`, so no startup files), with your stdin, umask and normal signal handling. It lets go of its own copies of your terminal output, so a caller waiting for output to end isn't held open, and it stays alive until every process in the group has exited.
 3. **Stop never signals a pid from the mod.** Pressing stop writes `<token>.stop`. The supervisor sees it, sends `SIGTERM` to its own group, and after 3 seconds `SIGKILL`. It leads the group and is alive while it does this, so the group id can't belong to anything else. Before writing the stop file, the mod confirms the supervisor is still running, with the same pid and start time and its token in its command line.
 4. **Stop is confirmed, not assumed.** A job is reported stopped only once its supervisor is gone. If it's still running after 12 seconds, the job goes back to running with a note. If processes of the group outlive the supervisor (for example a `sudo` child that ignores the signal), they're listed and left alone.
 
-**Anything not launched through the supervisor is shown, never stopped.** That covers:
-- your own servers
-- foreground lines with more than one command, or with leftover operators (`node app.js & &`, `npm run dev &&`)
-- foreground lines with any of these:
-  - comments or backslash escapes
-  - subshells, groups or command substitutions
-  - heredocs, or `if`/`for` blocks
-  - `exec`, `eval` or `source`
+**Anything not launched through the supervisor is never stopped.** Your own servers on the machine are listed read-only. A line the mod can't read reliably runs exactly as written and is neither recorded nor refused, because refusing a command it can't read could block one that never starts a server:
+- lines the shell would reject (`node app.js & &`, `npm run dev &&`)
+- comments, backslash escapes, `$'…'` quoting, or quotes glued to other text (`set''sid`)
+- subshells, groups, command substitutions, heredocs, or `if`/`for` blocks
+- `exec`, `eval`, `source`, `cd -`, `pushd +N`, or a command word that is a variable (`$X dev`)
 - any line that calls `setsid`, by path or inside double quotes too
 - every job on a machine without `/usr/bin/perl`, `/usr/bin/env` or `/bin/ps`
+
+A readable foreground line with an `&` in the middle (`npm run dev & sleep 2 && curl …`) can't be wrapped without changing what the call returns, so it runs as written with no stop button; it is still checked for duplicates.
 
 **Task mode.** A `run_in_background` call, or a foreground long runner, ends when its launching shell goes away, so interrupting the call still stops the job. A job sent to the background with `&` keeps running after the call, as it would without the mod.
 
@@ -38,13 +37,15 @@ Known dev servers and watchers are recognised by command:
 - `tsc -w`, Jest and Vitest watch
 - Rails, `python -m http.server`, uvicorn, Flask, Docker Compose, and more
 
-Ports come from `lsof`, so this targets macOS and Linux. Commands are stored with env assignments removed and secret-looking values hidden; the duplicate check keeps only a digest of the command.
+Ports come from `lsof` (read every few seconds at most, and fresh when you open `/procs` or a job starts), so this targets macOS and Linux. The mod runs `ps`, `lsof` and `rm` by absolute system path, never through your `PATH`. Commands are stored with env assignments removed and secret-looking values hidden; the duplicate check keeps only a digest of the command.
 
 Limits:
 - A plain command that Claude Code moves to the background after a timeout wasn't launched under the supervisor, so it gets no stop button.
 - A job that starts its own new session (`setsid` inside a script) leaves the group and isn't stopped with it.
 - A supervised job runs in a fresh shell. Aliases, shell functions (including exported bash functions) and zsh startup files from your setup aren't available to it, though exported variables and your `PATH` are.
-- Within one command, a job is checked for duplicates only against jobs of earlier lists sent to the background with `&`. `npm run dev || npm run dev &` is allowed; `npm run dev & npm run dev` is refused.
+- Within one command, a job is checked for duplicates only against jobs of earlier lists sent to the background with `&`, or other commands of the same pipeline. `npm run dev || npm run dev &` is allowed; `npm run dev & npm run dev` is refused.
+- A wrapped foreground list runs in the supervisor's shell, so a `cd` in it doesn't change the folder of later Bash calls (it wouldn't for a line ending in `&` either).
+- `go run` and programs named `serve` are always treated as long runners, so a one-shot `go run ./migrate.go` is supervised like a server.
 
 ## What it hooks
 
@@ -75,6 +76,8 @@ Full policy: [PRIVACY.md](PRIVACY.md).
 ```
 
 ## Develop
+
+`bash tests/pc-run-real.sh` runs the supervisor for real (inherited job control, a hostile `PATH`/`PERL5OPT`, exit status); the plugin tests mock the OS.
 
 ```
 claude plugin validate .

@@ -17,7 +17,8 @@
 
 # Every program this script runs is named by absolute path, and before any perl runs the environment is cleaned of
 # what could make it run code the approved command never named: PERL5OPT and friends (read by perl before -e),
-# and exported shell functions (which a shell imports and which would shadow commands by name). Until then only
+# exported shell functions (which a shell imports and which would shadow commands by name), and SHELLOPTS/BASHOPTS
+# (which would turn on job control or errexit in every bash below). Until then only
 # `case` and `exec` are used: special builtins that a function can't replace. The job gets PERL5OPT/PERL5LIB back.
 
 tok=$1
@@ -38,12 +39,17 @@ case "${PC_RUN_GROUP:-}" in
     PC_RUN_P5O=${PERL5OPT-}
     PC_RUN_P5L=${PERL5LIB-}
     export PC_RUN_GROUP PC_RUN_PARENT PC_RUN_P5O PC_RUN_P5L
-    exec /usr/bin/env -u PERL5OPT -u PERL5LIB -u PERLLIB -u PERL5DB -u BASH_ENV -u ENV /usr/bin/perl -e '
+    exec /usr/bin/env -u PERL5OPT -u PERL5LIB -u PERLLIB -u PERL5DB -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS /usr/bin/perl -e '
       for (keys %ENV) { delete $ENV{$_} if /^BASH_FUNC_/ || $ENV{$_} =~ /^\(\)\s*\{/ }
+      delete @ENV{qw(SHELLOPTS BASHOPTS)};
       setpgrp(0, 0);
       exec "/bin/sh", @ARGV' "$0" "$@"
     ;;
 esac
+# Inherited shell options are gone from the environment (SHELLOPTS/BASHOPTS were dropped above, so bash in sh
+# mode can't re-enable them); switch the ones that matter off here too. Job control (`monitor`) would put the
+# job in a process group of its own, out of reach of this supervisor; errexit would end it on the job's status.
+set +m +e +u 2>/dev/null
 parent=${PC_RUN_PARENT:-0}
 unset PC_RUN_GROUP PC_RUN_PARENT
 case "$sh_" in /*) [ -x "$sh_" ] || sh_=/bin/sh ;; *) sh_=/bin/sh ;; esac

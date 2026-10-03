@@ -60,7 +60,7 @@ export function unquote(cmd: string): string {
 
 // `list` numbers the shell lists (separated by `;`, `&` and newlines): a list ended by `&` runs in a
 // background subshell, so a `cd` inside it never reaches the lists after it.
-export type Segment = { text: string; background: boolean; list: number; listBackground: boolean; start: number; end: number }
+export type Segment = { text: string; background: boolean; list: number; listBackground: boolean; piped: boolean; start: number; end: number }
 
 // Split a command line into simple commands on &&, ||, ;, |, & and newlines, outside quotes.
 // `background` marks the ones a single `&` sends to the background.
@@ -69,11 +69,14 @@ export function segments(cmd: string): Segment[] {
   const out: Segment[] = []
   let start = 0
   let list = 0
-  const push = (end: number, background: boolean, endsList: boolean) => {
+  // A pipeline's commands all run at the same time: each is marked `piped`.
+  let pipedIn = false
+  const push = (end: number, background: boolean, endsList: boolean, pipeOut = false) => {
     const raw = cmd.slice(start, end)
     const text = raw.trim()
     const lead = raw.length - raw.trimStart().length
-    if (text !== '') out.push({ text, background, list, listBackground: false, start: start + lead, end: start + lead + text.length })
+    if (text !== '') out.push({ text, background, list, listBackground: false, piped: pipeOut || pipedIn, start: start + lead, end: start + lead + text.length })
+    pipedIn = pipeOut
     if (endsList) {
       for (const s of out) if (s.list === list) s.listBackground = background
       list += 1
@@ -83,7 +86,7 @@ export function segments(cmd: string): Segment[] {
     const c = mask[i]
     const two = mask.slice(i, i + 2)
     if (two === '&&' || two === '||' || two === '|&') {
-      push(i, false, false)
+      push(i, false, false, two === '|&')
       i += 1
       start = i + 1
     } else if (c === '&' && mask[i - 1] !== '>' && mask[i + 1] !== '>') {
@@ -92,8 +95,8 @@ export function segments(cmd: string): Segment[] {
     } else if (c === ';' || c === '\n') {
       push(i, false, true)
       start = i + 1
-    } else if (c === '|') {
-      push(i, false, false)
+    } else if (c === '|' && mask[i - 1] !== '>') {
+      push(i, false, false, true)
       start = i + 1
     }
   }
@@ -182,7 +185,7 @@ export function jobs(cmd: string, wholeInBackground: boolean): Job[] {
   const segs = segments(cmd).map((s, index) => ({ ...s, index })).filter(s => !NOT_A_JOB.test(s.text))
   const picked = segs.filter(s => s.background || isLongRunner(s.text) || /^(nohup|setsid)\s/.test(s.text))
   if (picked.length === 0 && wholeInBackground && segs.length > 0) picked.push(segs[segs.length - 1] as (typeof segs)[number])
-  return picked.map(s => ({ text: s.text, index: s.index, concurrent: s.listBackground, list: s.list }))
+  return picked.map(s => ({ text: s.text, index: s.index, concurrent: s.listBackground || s.piped, list: s.list }))
 }
 
 // A port the segment asks for on its command line (not through PORT=): the process shows it there too.
@@ -305,22 +308,40 @@ function resolveDir(dir: string, target: string, home: string): string {
 // directory its own `env -C` or package-manager `--prefix`/`-C`/`--dir`/`--cwd` names.
 export function startDir(cmd: string, index: number, cwd: string, home: string): string {
   let dir = normalize(cwd)
+  const stack: string[] = []
   const segs = segments(cmd)
   const target = segs[index]
   for (let i = 0; i < index && i < segs.length; i += 1) {
     const seg = segs[i] as Segment
     // A `cd` in an earlier list that ran in the background changed only that subshell's folder.
     if (seg.list !== target?.list && seg.listBackground) continue
-    const m = seg.text.match(/^(cd|pushd)\s+("[^"]+"|'[^']+'|\S+)\s*$/)
-    if (m !== null) dir = resolveDir(dir, m[2] as string, home)
+    const m = seg.text.match(/^(cd|pushd|popd)(?:\s+("[^"]+"|'[^']+'|\S+))?\s*$/)
+    if (m === null) continue
+    const verb = m[1] as string
+    const arg = m[2]
+    if (verb === 'popd') dir = stack.pop() ?? dir
+    else if (arg === undefined) dir = verb === 'cd' && home !== '' ? normalize(home) : dir
+    else {
+      if (verb === 'pushd') stack.push(dir)
+      dir = resolveDir(dir, arg, home)
+    }
   }
   const own = segs[index]?.text ?? ''
   const raw = own.match(/"[^"]*"|'[^']*'|\S+/g) ?? []
-  for (let i = 0; i < raw.length - 1; i += 1) {
+  let envSeen = false
+  for (let i = 0; i < raw.length; i += 1) {
     const w = raw[i] as string
-    const prev = raw[i - 1]
-    if (w === '-C' && (prev === 'env' || raw.slice(0, i).includes('env'))) dir = resolveDir(dir, raw[i + 1] as string, home)
-    else if (PM_DIR_FLAGS.has(w) && raw.slice(0, i).some(x => PACKAGE_MANAGERS.has(base(x)))) dir = resolveDir(dir, raw[i + 1] as string, home)
+    // Arguments after `--` belong to the script, never to npm or env.
+    if (w === '--') break
+    if (base(w) === 'env') {
+      envSeen = true
+      continue
+    }
+    const next = raw[i + 1]
+    if (envSeen && (w === '-C' || w === '--chdir') && next !== undefined) dir = resolveDir(dir, next, home)
+    else if (envSeen && /^--chdir=/.test(w)) dir = resolveDir(dir, w.slice('--chdir='.length), home)
+    else if (envSeen && /^-C./.test(w)) dir = resolveDir(dir, w.slice(2), home)
+    else if (PM_DIR_FLAGS.has(w) && next !== undefined && raw.slice(0, i).some(x => PACKAGE_MANAGERS.has(base(x)))) dir = resolveDir(dir, next, home)
   }
   return dir
 }
@@ -385,7 +406,8 @@ export const TOKEN = /^[0-9a-f]{16,64}$/
 
 // The command line that runs `command` under the supervisor script, in `shell` (the shell the Bash tool uses).
 export function supervised(script: string, token: string, ledger: string, mode: Mode, shell: string, command: string): string {
-  return `/bin/sh ${q(script)} ${token} ${q(ledger)} ${mode} ${q(shell)} -- ${q(command)}`
+  // SHELLOPTS/BASHOPTS are dropped before /bin/sh starts, so inherited errexit or noexec can't stop the supervisor.
+  return `/usr/bin/env -u SHELLOPTS -u BASHOPTS /bin/sh ${q(script)} ${token} ${q(ledger)} ${mode} ${q(shell)} -- ${q(command)}`
 }
 
 // Shell syntax this mod does not split safely: a job inside it is left as it is (and shown without a stop button).
@@ -408,52 +430,107 @@ function withoutSingleQuotes(text: string): string {
   return out
 }
 
-// Lexical constructs this mod does not split safely: an unquoted `#` comment, or any backslash escape.
+// Lexical constructs this mod does not split safely: an unquoted `#` comment, any backslash escape, `$'…'` /
+// `$"…"` quoting, and a quoted span glued to other word text (`set''sid`, `"set"sid`), where the word the
+// shell runs is not the text as written.
 export function lexicallyUnsafe(cmd: string): boolean {
   if (cmd.includes('\\')) return true
-  return /(^|[\s;&|])#/.test(unquote(cmd))
+  if (cmd.includes("$'") || cmd.includes('$"')) return true
+  if (/(^|[\s;&|])#/.test(unquote(cmd))) return true
+  return gluedQuotes(cmd)
+}
+
+// True when a quoted span starts right after word text or ends right before it. `--port="3000"` is fine (`=`).
+function gluedQuotes(cmd: string): boolean {
+  const word = /[A-Za-z0-9_./-]/
+  let quote = ''
+  for (let i = 0; i < cmd.length; i += 1) {
+    const c = cmd[i] as string
+    if (quote === '') {
+      if (c === '"' || c === "'") {
+        if (i > 0 && word.test(cmd[i - 1] as string)) return true
+        quote = c
+      }
+    } else if (c === quote) {
+      quote = ''
+      if (i + 1 < cmd.length && word.test(cmd[i + 1] as string)) return true
+    }
+  }
+  return false
+}
+
+// A command word the shell computes (`$X npm run dev`, `"$RUNNER" dev`): what runs can't be read from the text.
+function dynamicCommand(cmd: string): boolean {
+  for (const seg of segments(cmd)) {
+    const ws = seg.text.match(/"[^"]*"|'[^']*'|\S+/g) ?? []
+    const first = ws.find(w => !/^[A-Za-z_]\w*=/.test(w)) ?? ''
+    if (/^["']?\$/.test(first)) return true
+  }
+  return false
+}
+
+// Everything that keeps a command line from being handed to the supervisor whole.
+export function wrapUnsafe(cmd: string): boolean {
+  const plain = unquote(cmd)
+  const live = withoutSingleQuotes(cmd)
+  return (
+    lexicallyUnsafe(cmd) || /<</.test(plain) || UNSAFE.test(plain) || /\$\(|`/.test(live) || dynamicCommand(cmd) ||
+    // `setsid` as a word anywhere, by path too, and inside double quotes (a `bash -c "setsid …"`).
+    /(^|[\s;&|("])(\S*\/)?setsid(?=$|[\s;&|)"])/.test(live) ||
+    segments(cmd).some(s => /^(exec|eval|source|\.)(\s|$)/.test(s.text) || /^cd\s+-(\s|$)/.test(s.text) || /^(pushd|popd)\s+[+-]/.test(s.text))
+  )
+}
+
+// The text between the segments is exactly one operator each, nothing before the first, and after the last
+// whatever `tail` allows: a leftover operator (`node app.js & &`, `npm run dev ||`) means the shell would fail.
+function wellFormed(cmd: string, segs: Segment[], tail: RegExp): boolean {
+  const first = segs[0]
+  const last = segs[segs.length - 1]
+  if (first === undefined || last === undefined) return false
+  if (!/^\s*$/.test(cmd.slice(0, first.start)) || !tail.test(cmd.slice(last.end))) return false
+  for (let i = 1; i < segs.length; i += 1) {
+    const between = cmd.slice((segs[i - 1] as Segment).end, (segs[i] as Segment).start)
+    const op = between.replace(/\s+/g, '')
+    if (op === '' ? !between.includes('\n') : !/^(&&|\|\||\||\|&|;|&)$/.test(op)) return false
+  }
+  return true
 }
 
 export type Wrapped = { text: string; index: number; token: string; mode: Mode; also: Job[] }
 export type Wrap = { command: string; jobs: Wrapped[]; unsafe: Job[] }
 
-// Rewrite a command so the job it starts runs under the supervisor, without ever splitting the command line:
-// - a run-in-background call is wrapped whole, so the user's shell runs the original text unchanged (task mode:
-//   the background task lasts as long as everything it started);
-// - a foreground call is wrapped only when it is exactly one simple command, optionally sent to the background
-//   with one trailing `&` (detached). Anything else (several commands, comments, escapes, subshells, groups,
-//   substitutions, heredocs, control keywords, `exec`, `setsid`) is left untouched and shown without a stop button.
+// Rewrite a command so the jobs it starts run under the supervisor, never splitting the command line: the user's
+// shell runs the original text unchanged inside one supervised process group.
+// - a run-in-background call is wrapped whole (task mode: the background task lasts as long as its group);
+// - a foreground call is wrapped whole when nothing in it is backgrounded (task mode), or when its only
+//   background `&` is the one at the very end (detached: the supervisor goes to the background in its place).
+// Anything else (an `&` mid-line, comments, escapes, glued or ANSI-C quotes, subshells, groups, substitutions,
+// heredocs, control keywords, computed command words, `exec`, `setsid`, `cd -`) is left untouched, and then
+// nothing about it is recorded or refused: running a command this mod can't read is the safe failure.
 export function wrap(cmd: string, wholeInBackground: boolean, script: string, ledger: string, shell: string, token: () => string): Wrap {
   const picked = jobs(cmd, wholeInBackground)
   if (picked.length === 0) return { command: cmd, jobs: [], unsafe: [] }
-  const untouched = { command: cmd, jobs: [], unsafe: picked }
-  // `setsid` as a word anywhere, by path too, and inside double quotes (a `bash -c "setsid …"`).
-  if (/(^|[\s;&|("])(\S*\/)?setsid(?=$|[\s;&|)"])/.test(withoutSingleQuotes(cmd))) return untouched
-  if (wholeInBackground) {
-    const t = token()
-    const main = picked.find(j => isLongRunner(j.text)) ?? (picked[picked.length - 1] as Job)
-    const also = picked.filter(j => j !== main)
-    return { command: supervised(script, t, ledger, 'task', shell, cmd), jobs: [{ text: main.text, index: main.index, token: t, mode: 'task', also }], unsafe: [] }
-  }
   const segs = segments(cmd)
-  const seg = segs[0]
-  const plain = unquote(cmd)
-  const live = withoutSingleQuotes(cmd)
-  // Nothing before the one command, and after it nothing, or exactly one `&`: any other operator left over (an
-  // empty segment the split dropped, as in `node app.js & &`) means the original is not what would be wrapped.
-  const head = seg === undefined ? 'x' : cmd.slice(0, seg.start)
-  const tail = seg === undefined ? 'x' : cmd.slice(seg.end)
-  if (
-    seg === undefined || segs.length !== 1 || !/^\s*$/.test(head) || !(seg.background ? /^\s*&\s*$/ : /^\s*$/).test(tail) ||
-    lexicallyUnsafe(cmd) || /<</.test(plain) || UNSAFE.test(plain) || /\$\(|`/.test(live) || /^(exec|eval|source|\.)(\s|$)/.test(seg.text)
-  ) return untouched
+  // Left as it is. `unsafe` then holds the jobs only when the line reads reliably (the duplicate check may still
+  // refuse it); for a line this mod can't read, or one the shell would reject, it is empty: nothing is checked.
+  const readable = !wrapUnsafe(cmd) && wellFormed(cmd, segs, /^\s*&?\s*$/)
+  const untouched = { command: cmd, jobs: [], unsafe: readable ? picked : [] }
+  if (!readable) return untouched
+  const main = picked.find(j => isLongRunner(j.text)) ?? (picked[picked.length - 1] as Job)
+  const also = picked.filter(j => j !== main)
   const t = token()
-  const job = picked[0] as Job
-  if (seg.background) {
-    // One command and a trailing `&`: the supervisor goes to the background in its place.
-    return { command: `${supervised(script, t, ledger, 'detached', shell, seg.text)} &`, jobs: [{ text: job.text, index: 0, token: t, mode: 'detached', also: [] }], unsafe: [] }
+  const one = (mode: Mode) => [{ text: main.text, index: main.index, token: t, mode, also }]
+  if (wholeInBackground) return { command: supervised(script, t, ledger, 'task', shell, cmd), jobs: one('task'), unsafe: [] }
+  if (!segs.some(s => s.listBackground)) {
+    return { command: supervised(script, t, ledger, 'task', shell, cmd.trim()), jobs: one('task'), unsafe: [] }
   }
-  return { command: supervised(script, t, ledger, 'task', shell, cmd.trim()), jobs: [{ text: job.text, index: 0, token: t, mode: 'task', also: [] }], unsafe: [] }
+  // Backgrounded: only the last shell list, ended by the line's one `&`.
+  const lastList = (segs[segs.length - 1] as Segment).list
+  if (segs.some(s => s.listBackground !== (s.list === lastList)) || !wellFormed(cmd, segs, /^\s*&\s*$/)) return untouched
+  const first = segs.find(s => s.list === lastList) as Segment
+  if (segs.some(s => s.list !== lastList)) return untouched
+  const inner = cmd.slice(first.start, (segs[segs.length - 1] as Segment).end)
+  return { command: `${supervised(script, t, ledger, 'detached', shell, inner)} &`, jobs: one('detached'), unsafe: [] }
 }
 
 export type Ledger = { pid: number; lstart: string; mode: string; cwd: string }

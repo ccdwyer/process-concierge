@@ -37,6 +37,16 @@ let ledgerDir = ''
 let script = ''
 // The shell the Bash tool runs commands in, so a supervised job is run by the same one.
 let shell = '/bin/sh'
+// System helpers by absolute path, found once at load: a program earlier on PATH (a project's own `ps`) never runs.
+const BIN = { ps: '', lsof: '', rm: '' }
+const CANDIDATES: Record<keyof typeof BIN, string[]> = {
+  ps: ['/bin/ps', '/usr/bin/ps'],
+  lsof: ['/usr/sbin/lsof', '/usr/bin/lsof', '/sbin/lsof'],
+  rm: ['/bin/rm', '/usr/bin/rm'],
+}
+// The listener table, kept for a few seconds: lsof can take a while on macOS, and every Bash call asks.
+let lsofCache: { at: number; ports: Map<number, number[]> } | null = null
+const LSOF_TTL_MS = 5_000
 let counter = 0
 let ticker: { cancel: () => void } | null = null
 // Each rewritten command, to the arguments the model asked for and the exact arguments the call carries after
@@ -63,17 +73,35 @@ async function run($: Engine, argv: string[], timeoutMs = 5_000): Promise<Ran> {
 
 // The whole process table, or null when it could not be read in full.
 async function psRows($: Engine): Promise<PsRow[] | null> {
-  const r = await run($, ['ps', '-axww', '-o', 'pid=,ppid=,pgid=,pcpu=,rss=,lstart=,command='])
+  if (BIN.ps === '') return null
+  const r = await run($, [BIN.ps, '-axww', '-o', 'pid=,ppid=,pgid=,pcpu=,rss=,lstart=,command='])
   if (r.exitCode !== 0 || r.truncated) return null
   const rows = parsePs(r.stdout)
   return rows.length > 0 ? rows : null
 }
 
 // Every TCP listener on the machine: pid -> ports.
-async function listening($: Engine): Promise<Map<number, number[]>> {
-  const r = await run($, ['lsof', '-nP', '-iTCP', '-sTCP:LISTEN', '-Fpn'])
+async function listening($: Engine, fresh = false): Promise<Map<number, number[]>> {
+  if (BIN.lsof === '') return new Map()
+  const now = await $.clock.now()
+  if (!fresh && lsofCache !== null && now - lsofCache.at < LSOF_TTL_MS) return lsofCache.ports
+  const r = await run($, [BIN.lsof, '-nP', '-iTCP', '-sTCP:LISTEN', '-Fpn'])
   // lsof exits 1 when nothing listens.
-  return r.exitCode === 0 || r.exitCode === 1 ? parseLsof(r.stdout) : new Map()
+  const ports = r.exitCode === 0 || r.exitCode === 1 ? parseLsof(r.stdout) : new Map<number, number[]>()
+  lsofCache = { at: now, ports }
+  return ports
+}
+
+// Whether one process is still the one a ledger names: 'same', 'gone' (no such pid, or another start time), or
+// 'unknown' when the look itself failed (then nothing is deleted).
+async function stillThere($: Engine, pid: number, lstart: string): Promise<'same' | 'gone' | 'unknown'> {
+  if (BIN.ps === '' || !Number.isInteger(pid) || pid <= 0) return 'unknown'
+  const r = await run($, [BIN.ps, '-o', 'lstart=', '-p', String(pid)], 3_000)
+  const now = r.stdout.replace(/\s+/g, ' ').trim()
+  // ps exits 1 with no output when the pid does not exist.
+  if (r.exitCode === 1 && now === '') return 'gone'
+  if (r.exitCode !== 0) return 'unknown'
+  return now === lstart.replace(/\s+/g, ' ').trim() ? 'same' : 'gone'
 }
 
 async function realDir($: Engine, dir: string): Promise<string> {
@@ -114,7 +142,8 @@ async function readFile($: Engine, path: string): Promise<string | null> {
 async function removeLedger($: Engine, token: string): Promise<void> {
   if (!TOKEN.test(token) || ledgerDir === '') return
   const files = ['run', 'exit', 'stop', 'code', 'ps'].map(ext => `${ledgerDir}/${token}.${ext}`)
-  await run($, ['rm', '-f', '--', ...files], 3_000)
+  if (BIN.rm === '') return
+  await run($, [BIN.rm, '-f', '--', ...files], 3_000)
 }
 
 const alive = (p: Proc) => p.status === 'running' || p.status === 'starting' || p.status === 'stopping'
@@ -203,7 +232,11 @@ async function adoptFromLedger($: Engine, rows: PsRow[]): Promise<void> {
     const led = parseLedger((await readFile($, `${ledgerDir}/${name}`)) ?? '')
     const row = led === null ? null : supervisorRow(rows, led.pid, led.lstart, token)
     if (led === null || row === null) {
-      if (led !== null && !rows.some(r => r.pid === led.pid && r.lstart === led.lstart)) await removeLedger($, token)
+      // Absent from the boot-time table: look again at that one pid (it may have checked in since), and delete
+      // the ledger only when that look says it is gone.
+      if (led !== null && !rows.some(r => r.pid === led.pid && r.lstart === led.lstart) && (await stillThere($, led.pid, led.lstart)) === 'gone') {
+        await removeLedger($, token)
+      }
       continue
     }
     adopted += 1
@@ -244,7 +277,8 @@ async function finish($: Engine, p: Proc, rows: PsRow[], stopped: boolean): Prom
 
 // Re-check every live record: its supervisor, the group's ports, CPU and memory. A caller that already read the
 // process table passes it in, so one tool call reads it once.
-async function refresh($: Engine, rowsIn?: PsRow[] | null, portsIn?: Map<number, number[]>): Promise<void> {
+// `fresh`: read the listener table now rather than the few-seconds-old copy (a person looking, a start confirming).
+async function refresh($: Engine, rowsIn?: PsRow[] | null, portsIn?: Map<number, number[]>, fresh = false): Promise<void> {
   try {
     sessionId = await $.session.id()
   } catch {
@@ -255,7 +289,7 @@ async function refresh($: Engine, rowsIn?: PsRow[] | null, portsIn?: Map<number,
   const rows = rowsIn === undefined ? await psRows($) : rowsIn
   // A failed look changes nothing: absence is never inferred from a failed read.
   if (rows === null) return
-  const ports = portsIn ?? (await listening($))
+  const ports = portsIn ?? (await listening($, fresh))
   const ours = new Set<number>()
   // The newest table: a second look taken for one record serves every record after it.
   let latest = rows
@@ -453,10 +487,10 @@ async function planAt($: Engine, cmd: string, job: Job, cwd: string): Promise<Pl
 // After a call returns with jobs left running: look for their supervisors now and a few more times.
 async function track($: Engine, ids: string[], taskId: string | undefined): Promise<string> {
   for (const p of procs.filter(x => ids.includes(x.id))) p.taskId = taskId
-  await refresh($)
+  await refresh($, undefined, undefined, true)
   for (const ms of RETRIES_MS) {
     $.clock.after(ms, () => {
-      void refresh($)
+      void refresh($, undefined, undefined, true)
     })
   }
   const mine = procs.filter(x => ids.includes(x.id))
@@ -490,6 +524,15 @@ async function boot($: Engine): Promise<void> {
   shell = /^\/[\w/.-]*\/(zsh|bash)$/.test(userShell) ? userShell : '/bin/sh'
   // The supervisor needs perl (to lead a process group) and env (to start it clean); without them nothing is
   // rewritten, and jobs are shown without a stop button.
+  for (const key of Object.keys(CANDIDATES) as (keyof typeof BIN)[]) {
+    BIN[key] = ''
+    for (const path of CANDIDATES[key]) {
+      if (await exists($, path)) {
+        BIN[key] = path
+        break
+      }
+    }
+  }
   const ready = (await exists($, '/usr/bin/perl')) && (await exists($, '/usr/bin/env')) && (await exists($, '/bin/ps'))
   script = ready ? `${$.plugin.root}/bin/pc-run` : ''
   await loadStore($)
@@ -536,7 +579,7 @@ export const register: Register = on => {
     if (ticker === null) await boot($)
     if (arg === 'stop-all') return { text: `Process Concierge: ${await stopMany($, 'session')} from this session.` }
     if (arg === 'clean') return { text: `Process Concierge: ${await stopMany($, 'orphans')} from earlier sessions.` }
-    await refresh($)
+    await refresh($, undefined, undefined, true)
     await $.ui.open({ id: PANE, title: 'Processes' })
     return { text: summary(procs) }
   })
@@ -556,14 +599,21 @@ export const register: Register = on => {
     if (!background && longRunner(cmd) === null && !detaches(cmd)) return next(e)
     if (ledgerDir === '') return next(e)
 
+    // A command left unwrapped (unreadable to this mod, or no supervisor tools) is neither recorded nor refused.
+    let wrapped: ReturnType<typeof wrap>
+    try {
+      wrapped = script === '' ? { command: cmd, jobs: [], unsafe: [] } : wrap(cmd, background, script, ledgerDir, shell, newToken)
+    } catch {
+      wrapped = { command: cmd, jobs: [], unsafe: [] }
+    }
+    if (wrapped.jobs.length === 0 && wrapped.unsafe.length === 0) return next(e)
+
     const ids: string[] = []
     let command = cmd
     try {
       const rows = await psRows($)
       const listeners = await listening($)
       await refresh($, rows, listeners)
-      // Without the supervisor's tools, nothing is rewritten: every job is shown without a stop button.
-      const wrapped = script === '' ? { command: cmd, jobs: [], unsafe: jobs(cmd, background) } : wrap(cmd, background, script, ledgerDir, shell, newToken)
       const cwd = await $.session.cwd()
       const planned: { x: Planned; also: Planned[]; token: string; mode: Mode; supervised: boolean }[] = []
       const all = jobs(cmd, background)
@@ -573,7 +623,9 @@ export const register: Register = on => {
         const own = all.find(j => j.index === job.index) ?? { text: job.text, index: job.index, concurrent: false, list: 0 }
         planned.push({ x: await planAt($, cmd, own, cwd), also, token: job.token, mode: job.mode, supervised: true })
       }
-      for (const job of wrapped.unsafe) planned.push({ x: await planAt($, cmd, job, cwd), also: [], token: newToken(), mode: 'detached', supervised: false })
+      // Jobs of a line that reads reliably but was not wrapped (an `&` mid-line): checked for duplicates, never recorded.
+      const checkOnly: Planned[] = []
+      for (const job of wrapped.unsafe) checkOnly.push(await planAt($, cmd, job, cwd))
       const now = await $.clock.now()
       // From here to the reservation there is no await: check and reserve are one step. Within this one command
       // a job collides only with an earlier one still running beside it: one whose shell list was sent to the
@@ -583,7 +635,7 @@ export const register: Register = on => {
       // backgrounded lists, and a list's own jobs are added only after the whole list is checked.
       const ports: number[] = []
       const earlier: Planned[] = []
-      const inOrder = planned.flatMap(({ x, also }) => [x, ...also]).sort((a, b) => a.index - b.index)
+      const inOrder = [...planned.flatMap(({ x, also }) => [x, ...also]), ...checkOnly].sort((a, b) => a.index - b.index)
       const lists = [...new Set(inOrder.map(y => y.list))]
       for (const list of lists) {
         const members = inOrder.filter(y => y.list === list)
@@ -678,7 +730,7 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column">
         <Box>
-          <Button key="refresh" label="refresh" onPress={() => refresh($)} />
+          <Button key="refresh" label="refresh" onPress={() => refresh($, undefined, undefined, true)} />
           {mine > 0 ? <Button key="stop-all" label={`stop all from this session (${mine})`} onPress={() => stopMany($, 'session')} /> : null}
           {orphans > 0 ? <Button key="clean" label={`stop earlier sessions' jobs (${orphans})`} onPress={() => stopMany($, 'orphans')} /> : null}
           {finished > 0 ? <Button key="dismiss" label="clear finished" onPress={() => dismissFinished($)} /> : null}
